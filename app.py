@@ -104,6 +104,35 @@ def rank_stability(f: pd.DataFrame, top: str, n_boot: int = BOOT_N, block: int =
     return float((sd.argmax(axis=1) == list(W.columns).index(top)).mean())
 
 
+def sens_stability(f: pd.DataFrame, group_of: dict, top: str, n_boot: int = BOOT_N,
+                   block: int = BLOCK, seed: int = 0):
+    """경기 민감도 1위의 안정성. 월별 자료를 block개월 단위로 다시 뽑아(블록 부트스트랩, 업종과 전산업은 같은 달끼리)
+    민감도(기울기)를 다시 계산했을 때, 처음의 1위(top)가 계속 1위인 비율과 가장 자주 1위를 뺏은 업종.
+    계산할 수 없으면 None."""
+    W = f.pivot(index="월", columns="업종", values="값").sort_index()
+    if "전산업" not in W.columns:
+        return None
+    ind = [c for c in W.columns if group_of.get(c) == "업종"]
+    W = W[["전산업"] + ind].dropna()
+    n = len(W)
+    if n < max(block, MIN_MONTHS) or len(ind) < 2 or top not in ind:
+        return None
+    X, Y = W["전산업"].to_numpy(float), W[ind].to_numpy(float)
+    rng = np.random.default_rng(seed)  # 시드 고정
+    k = -(-n // block)
+    starts = rng.integers(0, n - block + 1, size=(n_boot, k))
+    idx = (starts[:, :, None] + np.arange(block)).reshape(n_boot, -1)[:, :n]
+    x, y = X[idx], Y[idx]                                  # (n_boot, n), (n_boot, n, 업종 수)
+    xc = x - x.mean(axis=1, keepdims=True)
+    slope = (xc[:, :, None] * (y - y.mean(axis=1, keepdims=True))).sum(axis=1) / (xc ** 2).sum(axis=1)[:, None]
+    win = slope.argmax(axis=1)
+    share = np.bincount(win, minlength=len(ind)) / n_boot
+    ti = ind.index(top)
+    others = [(share[i], ind[i]) for i in range(len(ind)) if i != ti]
+    c_share, c_name = max(others)
+    return {"p": float(share[ti]), "challenger": c_name, "challenger_p": float(c_share)}
+
+
 def compute_drawdown(f: pd.DataFrame, group_of: dict, smooth: bool = False) -> pd.DataFrame:
     """선택 기간 안에서 최고점에서 이후 최저점까지의 최대 하락폭(포인트).
     smooth=True면 SMOOTH_MONTHS개월 이동평균 위에서 계산해 한두 달 튀는 값의 영향을 줄인다."""
@@ -204,7 +233,7 @@ def weak_links(sens: pd.DataFrame) -> list:
     return [] if sens.empty else sens[sens["R2"] < SENS_WEAK_R2]["업종"].tolist()
 
 
-def sens_sentences(sens: pd.DataFrame) -> list:
+def sens_sentences(sens: pd.DataFrame, stab: dict = None) -> list:
     r = sens.sort_values("민감도", ascending=False)
     top, bottom = r.iloc[0], r.iloc[-1]
     text = (
@@ -216,14 +245,29 @@ def sens_sentences(sens: pd.DataFrame) -> list:
     if weak:
         text += (f" 전산업과의 연동이 약한 업종(R² {SENS_WEAK_R2:.1f} 미만)은 {' · '.join(weak)}이며, "
                  "이들의 등락은 경기보다 업종 고유 요인의 몫이 큽니다.")
+    if stab is not None and stab["p"] < 0.6:  # 순위가 불안정하면 단정을 피한다
+        text += (f" 다만 월별 자료를 다시 뽑으면 1위가 유지될 확률이 {stab['p'] * 100:.0f}%뿐이고 "
+                 f"가장 자주 1위를 차지한 업종은 {stab['challenger']}({stab['challenger_p'] * 100:.0f}%)여서, 1위는 잠정적입니다.")
     return [text]
 
 
-def limit_lines(v: dict, sens: pd.DataFrame = None) -> list:
+def limit_lines(v: dict, sens: pd.DataFrame = None, stab: dict = None) -> list:
     """한계 문장. 현재 데이터에서 계산한 숫자로 설명한다."""
     avg = v["avg"]
     top = v["top"]["업종"]
     lines = []
+    if stab is not None and sens is not None and not sens.empty:
+        s_name = sens.sort_values("민감도", ascending=False).iloc[0]["업종"]
+        q = stab["p"]
+        head = (f"월별 자료를 {BLOCK}개월 단위로 {BOOT_N:,}번 다시 뽑아 민감도를 다시 계산하면, "
+                f"민감도 1위({s_name})가 1위로 유지될 확률은 {q * 100:.0f}%이고 "
+                f"가장 자주 1위를 차지한 업종은 {stab['challenger']}({stab['challenger_p'] * 100:.0f}%)입니다. ")
+        if q >= 0.8:
+            lines.append(head + "순위가 안정적입니다.")
+        elif q >= 0.6:
+            lines.append(head + "순위의 안정성은 보통 수준이어서 1위와 2위권의 차이를 단정하기 어렵습니다.")
+        else:
+            lines.append(head + "기간을 조금만 바꿔도 1위가 바뀔 수 있습니다.")
     p = v.get("stability")
     if p is not None:
         head = (f"월별 자료를 {BLOCK}개월 단위로 {BOOT_N:,}번 다시 뽑아 계산하면, "
@@ -379,20 +423,38 @@ def system_span(system: str) -> str:
 
 st.markdown(f"""
 <style>
-.block-container {{ padding-top: 2.2rem; max-width: 1280px; }}
-h1 {{ color: {NAVY}; font-weight: 700; letter-spacing: -0.02em; padding-bottom: 0; }}
-h2, h3 {{ color: {NAVY}; letter-spacing: -0.01em; }}
-.eyebrow {{ color: #1c5cab; font-size: .78rem; font-weight: 700; letter-spacing: .08em; margin-bottom: .2rem; }}
-.lead {{ color: #52606d; font-size: 1.02rem; margin: .1rem 0 .4rem; }}
-[data-testid="stMetricLabel"] p {{ color: #52606d; font-weight: 600; }}
-[data-testid="stMetricValue"] {{ color: {NAVY}; font-weight: 700; }}
-button[role="tab"] p {{ font-weight: 600; }}
+.block-container {{ padding-top: 1.4rem; max-width: 1280px; }}
+header[data-testid="stHeader"] {{ background: transparent; }}
+/* 상단 배너 */
+.banner {{ background: linear-gradient(135deg, {NAVY} 0%, #1f3d73 100%); border-radius: 10px;
+          padding: 1.5rem 1.8rem 1.4rem; margin-bottom: 1rem; }}
+.banner .eyebrow {{ color: #9fb8e0; font-size: .76rem; font-weight: 700; letter-spacing: .1em; margin-bottom: .35rem; }}
+.banner .title {{ color: #ffffff; font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; }}
+.banner .lead {{ color: #d6e2f5; font-size: 1.02rem; margin-top: .45rem; }}
+h2, h3 {{ color: {NAVY}; letter-spacing: -0.01em; font-weight: 700; }}
+/* 지표 카드 */
+[data-testid="stVerticalBlockBorderWrapper"] {{ background: #ffffff; border-color: #dfe4ec; border-radius: 8px; }}
+[data-testid="stColumn"] [data-testid="stVerticalBlockBorderWrapper"] {{
+    border-top: 3px solid {NAVY}; box-shadow: 0 1px 3px rgba(20,40,75,.08); }}
+[data-testid="stMetricLabel"] p {{ color: #52606d; font-weight: 600; font-size: .86rem; }}
+[data-testid="stMetricValue"] {{ color: {NAVY}; font-weight: 700; font-size: 1.9rem; }}
+/* 탭 */
+button[role="tab"] p {{ font-weight: 600; font-size: .98rem; }}
+button[role="tab"][aria-selected="true"] {{ color: {NAVY}; }}
+div[data-baseweb="tab-highlight"] {{ background-color: {NAVY}; height: 3px; }}
+/* 사이드바 */
+[data-testid="stSidebar"] {{ border-right: 1px solid #dfe4ec; }}
+[data-testid="stSidebar"] h2 {{ font-size: 1.05rem; color: {NAVY}; border-bottom: 2px solid {NAVY};
+                               padding-bottom: .4rem; }}
+/* 펼침 상자 */
+[data-testid="stExpander"] {{ border-color: #dfe4ec; border-radius: 8px; background: #fbfcfe; }}
 </style>
+<div class="banner">
 <div class="eyebrow">한국은행 기업경기조사 · 업종별 체감 업황</div>
+<div class="title">업종별 기업 체감경기 대시보드</div>
+<div class="lead">경기 변동에 가장 민감하게 반응한 업종은 어디인가?</div>
+</div>
 """, unsafe_allow_html=True)
-st.title("업종별 기업 체감경기 대시보드")
-st.markdown('<div class="lead">경기 변동에 가장 민감하게 반응한 업종은 어디인가?</div>',
-            unsafe_allow_html=True)
 st.caption(md("왼쪽에서 조건을 바꾸면 지표, 차트, 결론이 함께 바뀝니다. "
               f"자료: 한국은행 「기업경기조사」 업종별 기업경기실사지수(국가통계포털 KOSIS), 월별 {df['월'].min():%Y.%m}~{df['월'].max():%Y.%m}. "
               "지수 = 100 + 긍정 응답 비중(%) − 부정 응답 비중(%), 기준값 100. "
@@ -433,6 +495,9 @@ if v is not None:
 dd = compute_drawdown(f_all, group_of, smooth)
 dd_ind = dd[dd["구분"] == "업종"] if not dd.empty else dd
 sens = compute_sensitivity(f_all, group_of)
+sens_stab = None
+if not sens.empty:
+    sens_stab = sens_stability(f_all, group_of, sens.sort_values("민감도", ascending=False).iloc[0]["업종"])
 
 # ---------------------------------------------------------------- 핵심 지표 + 결론 (화면 맨 위)
 def kpi(col, title: str, value: str, sub: str, help_text: str):
@@ -460,10 +525,12 @@ else:
         "기간 중 지수가 가장 크게 오르내린 업종")
     kpi(k3, "낙폭 1위", b, f"{dd_top['최고월']} → {dd_top['최저월']}, {dd_top['낙폭']:.0f}p 하락",
         "기간 안에서 최고점에서 이후 최저점까지 가장 크게 떨어진 업종")
-    p = v.get("stability")
-    kpi(k4, "출렁임 1위 안정성", "계산 불가" if p is None else f"{p * 100:.0f}%",
-        "출렁임 1위가 1위로 유지될 확률" if p is not None else "기간이 짧아 계산하지 않음",
-        f"월별 자료를 {BLOCK}개월 단위로 {BOOT_N:,}번 다시 뽑아 구한 값. 80% 이상 안정, 60% 미만은 순위가 바뀔 수 있음(설명용 기준)")
+    q = sens_stab["p"] if sens_stab else None
+    kpi(k4, "민감도 1위 안정성", "계산 불가" if q is None else f"{q * 100:.0f}%",
+        (f"가장 자주 1위를 뺏은 업종: {sens_stab['challenger']} {sens_stab['challenger_p'] * 100:.0f}%"
+         if q is not None else "기간이 짧아 계산하지 않음"),
+        f"월별 자료를 {BLOCK}개월 단위로 {BOOT_N:,}번 다시 뽑아 민감도를 다시 구했을 때 민감도 1위가 1위로 유지되는 비율. "
+        "80% 이상 안정, 60% 미만은 순위가 바뀔 수 있음(설명용 기준)")
 
 
 tab_sens, tab_trend, tab_vol, tab_dd = st.tabs(
@@ -540,7 +607,7 @@ with tab_dd:
 if v is not None and not dd_ind.empty:
     a = v["top"]["업종"]
     b = dd_ind.sort_values("낙폭", ascending=False).iloc[0]["업종"]
-    lines = (sens_sentences(sens) if not sens.empty else []) \
+    lines = (sens_sentences(sens, sens_stab) if not sens.empty else []) \
         + vol_sentences(v, label) + dd_sentences(dd_ind, label, smooth)
     lines.append(f"변동성 1위({a})와 낙폭 1위({b})가 " + (
         "같습니다." if a == b else
@@ -551,7 +618,7 @@ if v is not None and not dd_ind.empty:
     with st.container(border=True):
         st.markdown(md("\n\n".join(lines)))
     with st.expander("이 결론의 한계", expanded=True):
-        for item in limit_lines(v, sens):
+        for item in limit_lines(v, sens, sens_stab):
             st.markdown(md(f"- {item}"))
 
 with st.expander("출처와 집계 기준"):
@@ -571,7 +638,8 @@ with st.expander("출처와 집계 기준"):
         "- **경기 민감도:** 업종 지수를 전산업 지수에 단순회귀한 기울기이고, R²는 그 설명력입니다. "
         f"R² {SENS_WEAK_R2:.1f} 미만을 ‘연동이 약하다’고 보는 것은 설명용 기준입니다.\n"
         f"- **순위 안정성:** 월별 자료를 {BLOCK}개월 단위(1년을 통째로 담아 계절 패턴이 유지됨)로 "
-        f"{BOOT_N:,}번 다시 뽑아 표준편차 순위를 구하고, 처음의 1위가 계속 1위인 비율을 계산했습니다(블록 부트스트랩, 난수 시드 고정). "
+        f"{BOOT_N:,}번 다시 뽑아(업종과 전산업은 같은 달끼리) 민감도를 다시 구하고, 처음의 민감도 1위가 계속 1위인 비율을 계산했습니다. "
+        "표준편차 1위도 같은 방식으로 계산해 한계 문장에 씁니다(블록 부트스트랩, 난수 시드 고정). "
         "80% 이상 안정적, 60~80% 보통, 60% 미만은 순위가 바뀔 수 있다고 봅니다(설명용 기준).\n"
         f"- **낙폭 이동평균 옵션:** 켜면 {SMOOTH_MONTHS}개월 이동평균 위에서 최고점·최저점을 찾습니다(앞쪽 {SMOOTH_MONTHS - 1}개월은 계산에서 빠짐).\n"
         "- **업종 평균:** 이 앱의 업종 항목 평균이며 전체 경제의 평균이 아닙니다."
